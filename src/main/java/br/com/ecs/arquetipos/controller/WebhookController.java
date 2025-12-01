@@ -39,7 +39,7 @@ public class WebhookController {
 
     @PostMapping("/eduzz")
     public ResponseEntity<Map<String, Object>> receiveEduzzWebhook(@RequestBody Map<String, Object> payload) {
-        WebhookRequest request = parsePayload(payload, Provider.EDUZZ);
+        WebhookRequest request = parseEduzzPayload(payload);
         Subscriber saved = subscriberService.createOrUpdate(request, Provider.EDUZZ);
 
         Map<String, Object> body = Map.of(
@@ -171,6 +171,120 @@ public class WebhookController {
         }
 
         // Fallbacks mínimos
+        if (req.getEmail() == null || req.getEmail().isBlank()) {
+            throw new IllegalArgumentException("Email not found in webhook payload");
+        }
+        if (req.getName() == null || req.getName().isBlank()) {
+            String local = req.getEmail().split("@")[0];
+            req.setName(local);
+        }
+
+        return req;
+    }
+
+    // Parser específico para payloads do Eduzz (usando o exemplo fornecido)
+    @SuppressWarnings("unchecked")
+    private WebhookRequest parseEduzzPayload(Map<String, Object> payload) {
+        WebhookRequest req = new WebhookRequest();
+        if (payload == null) return req;
+
+        Object dataObj = payload.get("data");
+        if (!(dataObj instanceof Map)) {
+            throw new IllegalArgumentException("Invalid eduzz payload: missing data node");
+        }
+        Map<String, Object> data = (Map<String, Object>) dataObj;
+
+        // Prefer buyer, se não existir usa student
+        Map<String, Object> person = null;
+        if (data.get("buyer") instanceof Map) person = (Map<String, Object>) data.get("buyer");
+        else if (data.get("student") instanceof Map) person = (Map<String, Object>) data.get("student");
+
+        if (person != null) {
+            req.setEmail((String) person.get("email"));
+            req.setName((String) person.get("name"));
+
+            // tenta separar first/last name simples
+            String fullName = (String) person.get("name");
+            if (fullName != null && !fullName.isBlank()) {
+                String[] parts = fullName.trim().split(" ");
+                req.setFirstName(parts[0]);
+                if (parts.length > 1) req.setLastName(parts[parts.length - 1]);
+            }
+
+            // telefones: cellphone, phone, phone2
+            String phone = (String) person.get("cellphone");
+            if (phone == null) phone = (String) person.get("phone");
+            if (phone == null) phone = (String) person.get("phone2");
+            req.setPhone(phone);
+
+            req.setDocument((String) person.get("document"));
+
+            Object addressObj = person.get("address");
+            if (addressObj instanceof Map) {
+                Map<String, Object> addr = (Map<String, Object>) addressObj;
+                req.setZipcode((String) addr.get("zipCode"));
+                req.setCity((String) addr.get("city"));
+                req.setState((String) addr.get("state"));
+                req.setCountry((String) addr.getOrDefault("country", addr.get("country_iso")));
+            }
+        }
+
+        // Transaction/ids
+        if (data.get("transaction") instanceof Map) {
+            Map<String, Object> tx = (Map<String, Object>) data.get("transaction");
+            Object tid = tx.get("id");
+            if (tid != null) req.setTransactionId(String.valueOf(tid));
+        } else if (data.get("id") != null) {
+            req.setTransactionId(String.valueOf(data.get("id")));
+        }
+
+        // Items / product
+        Object itemsObj = data.get("items");
+        if (itemsObj instanceof Collection) {
+            for (Object it : (Collection<Object>) itemsObj) {
+                if (it instanceof Map) {
+                    Map<String, Object> item = (Map<String, Object>) it;
+                    Object pid = item.get("productId");
+                    if (pid != null && (req.getProductId() == null || req.getProductId().isBlank())) {
+                        req.setProductId(String.valueOf(pid));
+                    }
+                    if (req.getProductName() == null) req.setProductName((String) item.get("name"));
+                    // pega apenas o primeiro item útil
+                    break;
+                }
+            }
+        }
+
+        // Preço / valor pago
+        Object paidObj = data.get("paid");
+        if (paidObj instanceof Map) {
+            Map<String, Object> paid = (Map<String, Object>) paidObj;
+            Object val = paid.get("value");
+            if (val instanceof Number) req.setPrice(BigDecimal.valueOf(((Number) val).doubleValue()));
+            else if (val instanceof String) {
+                try { req.setPrice(new BigDecimal((String) val)); } catch (Exception ignored) {}
+            }
+            req.setCurrency((String) paid.get("currency"));
+        } else {
+            Object priceObj = data.get("price");
+            if (priceObj instanceof Map) {
+                Map<String, Object> price = (Map<String, Object>) priceObj;
+                Object val = price.get("value");
+                if (val instanceof Number) req.setPrice(BigDecimal.valueOf(((Number) val).doubleValue()));
+                else if (val instanceof String) {
+                    try { req.setPrice(new BigDecimal((String) val)); } catch (Exception ignored) {}
+                }
+                req.setCurrency((String) price.get("currency"));
+            }
+        }
+
+        // Datas de pagamento
+        Object paidAt = data.get("paidAt");
+        if (paidAt instanceof String) {
+            try { req.setPurchaseDate(Instant.parse((String) paidAt)); } catch (Exception ignored) {}
+        }
+
+        // Validações mínimas e fallbacks
         if (req.getEmail() == null || req.getEmail().isBlank()) {
             throw new IllegalArgumentException("Email not found in webhook payload");
         }

@@ -53,6 +53,22 @@ public class WebhookController {
         return ResponseEntity.created(URI.create("/subscribers/" + saved.getId())).body(body);
     }
 
+    @PostMapping("/kiwify")
+    public ResponseEntity<Map<String, Object>> receiveKiwifyWebhook(@RequestBody Map<String, Object> payload) {
+        WebhookRequest request = parseKiwifyPayload(payload);
+        Subscriber saved = subscriberService.createOrUpdate(request, Provider.KIWIFY);
+
+        Map<String, Object> body = Map.of(
+                "status", "success",
+                "id", saved.getId(),
+                "email", saved.getEmail(),
+                "name", saved.getName(),
+                "provider", "KIWIFY"
+        );
+
+        return ResponseEntity.created(URI.create("/subscribers/" + saved.getId())).body(body);
+    }
+
     // Backward-compatible generic endpoint: tenta inferir o provider a partir do payload
     @PostMapping
     public ResponseEntity<Map<String, Object>> receiveGenericWebhook(@RequestBody Map<String, Object> payload,
@@ -285,6 +301,97 @@ public class WebhookController {
         }
 
         // Validações mínimas e fallbacks
+        if (req.getEmail() == null || req.getEmail().isBlank()) {
+            throw new IllegalArgumentException("Email not found in webhook payload");
+        }
+        if (req.getName() == null || req.getName().isBlank()) {
+            String local = req.getEmail().split("@")[0];
+            req.setName(local);
+        }
+
+        return req;
+    }
+
+    @SuppressWarnings("unchecked")
+    private WebhookRequest parseKiwifyPayload(Map<String, Object> payload) {
+        WebhookRequest req = new WebhookRequest();
+        if (payload == null) return req;
+
+        // Customer block
+        Object custObj = payload.get("Customer");
+        if (custObj instanceof Map) {
+            Map<String, Object> customer = (Map<String, Object>) custObj;
+            req.setEmail((String) customer.get("email"));
+            String name = (String) customer.getOrDefault("full_name", customer.get("first_name"));
+            req.setName(name);
+            req.setFirstName((String) customer.get("first_name"));
+            req.setPhone((String) customer.get("mobile"));
+            // CPF field name may be 'CPF' or 'cpf'
+            req.setDocument((String) customer.getOrDefault("CPF", customer.get("cpf")));
+
+            // address
+            req.setZipcode((String) customer.get("zipcode"));
+            req.setCity((String) customer.get("city"));
+            req.setState((String) customer.get("state"));
+            req.setCountry(null);
+        }
+
+        // Product
+        Object prodObj = payload.get("Product");
+        if (prodObj instanceof Map) {
+            Map<String, Object> prod = (Map<String, Object>) prodObj;
+            Object pid = prod.get("product_id");
+            if (pid != null) req.setProductId(String.valueOf(pid));
+            req.setProductName((String) prod.get("product_name"));
+        }
+
+        // Transaction id
+        if (payload.get("order_id") != null) req.setTransactionId(String.valueOf(payload.get("order_id")));
+        else if (payload.get("order_ref") != null) req.setTransactionId(String.valueOf(payload.get("order_ref")));
+
+        // Price: prefer Commissions.my_commission or Commissions.product_base_price or charges.completed[0].amount
+        Object commObj = payload.get("Commissions");
+        if (commObj instanceof Map) {
+            Map<String, Object> comm = (Map<String, Object>) commObj;
+            Object amt = comm.getOrDefault("my_commission", comm.get("product_base_price"));
+            if (amt instanceof Number) {
+                // Kiwify geralmente envia em centavos
+                req.setPrice(BigDecimal.valueOf(((Number) amt).doubleValue() / 100.0));
+            } else if (amt instanceof String) {
+                try { req.setPrice(new BigDecimal((String) amt).divide(new BigDecimal(100))); } catch (Exception ignored) {}
+            }
+            req.setCurrency((String) comm.get("currency"));
+        }
+
+        // fallback: charges.completed[0].amount
+        if (req.getPrice() == null && payload.get("Subscription") instanceof Map) {
+            Map<String, Object> sub = (Map<String, Object>) payload.get("Subscription");
+            Object chargesObj = sub.get("charges");
+            if (chargesObj instanceof Map) {
+                Map<String, Object> charges = (Map<String, Object>) chargesObj;
+                Object completedObj = charges.get("completed");
+                if (completedObj instanceof Collection) {
+                    for (Object it : (Collection<Object>) completedObj) {
+                        if (it instanceof Map) {
+                            Map<String, Object> ch = (Map<String, Object>) it;
+                            Object a = ch.get("amount");
+                            if (a instanceof Number) {
+                                req.setPrice(BigDecimal.valueOf(((Number) a).doubleValue() / 100.0));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // approved_date
+        Object approved = payload.get("approved_date");
+        if (approved instanceof String) {
+            try { req.setPurchaseDate(Instant.parse(((String) approved).replace(" ", "T") + "Z")); } catch (Exception ignored) {}
+        }
+
+        // Validations
         if (req.getEmail() == null || req.getEmail().isBlank()) {
             throw new IllegalArgumentException("Email not found in webhook payload");
         }
